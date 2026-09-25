@@ -1,0 +1,427 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Détection du glaucome sur images de fond d'œil (ACRIMA )
+=====================================================================
+
+Pipeline : transfer learning (CNN pré-entraîné ImageNet via `timm`) + évaluation
+médicale (AUC, sensibilité, spécificité) + explicabilité (Grad-CAM).
+
+Deux protocoles d'évaluation :
+  - acrima   : entraînement/validation/test sur ACRIMA uniquement (intra-dataset)
+  - cross    : entraînement/validation sur ACRIMA (généralisation
+               inter-datasets, le protocole le plus honnête pour un article)
+
+Installation :
+    pip install torch torchvision timm scikit-learn pandas matplotlib pillow
+
+Exemples :
+    python glaucoma_detection.py --mode acrima   --acrima_dir data/ACRIMA
+       
+
+Format du fichier de labels Drishti-GS (CSV, une ligne par image) :
+    image,label
+    drishtiGS_001,glaucoma
+    drishtiGS_002,normal
+(label accepté : 0/1, normal/glaucoma, healthy/glaucomatous ...)
+"""
+
+import argparse
+import json
+import random
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import timm
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image
+from sklearn.metrics import (accuracy_score, confusion_matrix, f1_score,
+                             roc_auc_score, roc_curve)
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms as T
+
+IMG_EXT = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+# --------------------------------------------------------------------------- #
+# Utilitaires
+# --------------------------------------------------------------------------- #
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def norm_label(value) -> int:
+    """Convertit un label texte/numérique en 0 (normal) ou 1 (glaucome)."""
+    s = str(value).strip().lower()
+    if s in {"1", "1.0", "glaucoma", "glaucomatous", "abnormal", "pos", "positive", "g"}:
+        return 1
+    if s in {"0", "0.0", "normal", "healthy", "non-glaucoma", "neg", "negative", "n"}:
+        return 0
+    raise ValueError(f"Label non reconnu : {value!r}")
+
+
+# --------------------------------------------------------------------------- #
+# Chargement des datasets
+# --------------------------------------------------------------------------- #
+def load_acrima(root: str) -> pd.DataFrame:
+    """
+    ACRIMA : 705 images (396 glaucome, 309 normales).
+    Le label est déduit, dans l'ordre :
+      1) du nom du dossier parent (glaucoma/normal...) si présent ;
+      2) du nom de fichier : les images glaucomateuses contiennent '_g_' (ex. Im553_g_ACRIMA.png).
+    Vérifiez les effectifs affichés et adaptez si votre copie est organisée autrement.
+    """
+    rows = []
+    for p in sorted(Path(root).rglob("*")):
+        if p.suffix.lower() not in IMG_EXT:
+            continue
+        parent = p.parent.name.lower()
+        if any(k in parent for k in ("normal", "healthy", "non")):
+            label = 0
+        elif any(k in parent for k in ("glaucoma", "abnormal", "positive")):
+            label = 1
+        else:
+            label = int("_g_" in p.name.lower() or p.stem.lower().endswith("_g"))
+        rows.append({"path": str(p), "label": label, "source": "acrima"})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        raise FileNotFoundError(f"Aucune image trouvée dans {root}")
+    print(f"[ACRIMA]  {len(df)} images | glaucome={int(df.label.sum())} "
+          f"| normal={int((df.label == 0).sum())}")
+    return df
+
+
+def load_drishti(root: str, labels_csv: str) -> pd.DataFrame:
+    """
+    Drishti-GS1 : 101 images (50 train + 51 test dans la distribution d'origine).
+    On ne garde que les images du fond d'œil (les masques GT / SoftMap / AvgBoundary
+    sont ignorés) et on associe les labels via le CSV (correspondance sur le nom sans extension).
+    """
+    lab = pd.read_csv(labels_csv)
+    lab.columns = [c.strip().lower() for c in lab.columns]
+    if not {"image", "label"} <= set(lab.columns):
+        raise ValueError("Le CSV doit contenir les colonnes 'image' et 'label'.")
+    lab["key"] = lab["image"].astype(str).map(lambda s: Path(s).stem.lower())
+    lab["label"] = lab["label"].map(norm_label)
+    label_map = dict(zip(lab["key"], lab["label"]))
+
+    skip_dirs = {"gt", "softmap", "avgboundary", "masks", "mask"}
+    rows, unmatched = [], 0
+    for p in sorted(Path(root).rglob("*")):
+        if p.suffix.lower() not in IMG_EXT:
+            continue
+        if any(part.lower() in skip_dirs for part in p.parts):
+            continue
+        key = p.stem.lower()
+        if key not in label_map:
+            unmatched += 1
+            continue
+        rows.append({"path": str(p), "label": label_map[key], "source": "drishti"})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        raise FileNotFoundError("Aucune image Drishti-GS appariée avec le CSV de labels.")
+    if unmatched:
+        print(f"[Drishti] attention : {unmatched} image(s) sans label ignorée(s).")
+    print(f"[Drishti] {len(df)} images | glaucome={int(df.label.sum())} "
+          f"| normal={int((df.label == 0).sum())}")
+    return df
+
+
+def make_splits(df: pd.DataFrame, mode: str, seed: int):
+    if mode == "cross":
+        src = df[df.source == "acrima"]
+        test = df[df.source == "drishti"]
+        train, val = train_test_split(src, test_size=0.2, stratify=src.label, random_state=seed)
+    else:
+        strat = df.source + "_" + df.label.astype(str)
+        trainval, test = train_test_split(df, test_size=0.15, stratify=strat, random_state=seed)
+        strat_tv = trainval.source + "_" + trainval.label.astype(str)
+        train, val = train_test_split(trainval, test_size=0.1765, stratify=strat_tv,
+                                      random_state=seed)  # 0.1765 * 0.85 ≈ 0.15
+    for name, part in (("train", train), ("val", val), ("test", test)):
+        print(f"  {name:5s}: {len(part):4d} images | glaucome={int(part.label.sum())}")
+    return train.reset_index(drop=True), val.reset_index(drop=True), test.reset_index(drop=True)
+
+
+# --------------------------------------------------------------------------- #
+# Prétraitement / Dataset
+# --------------------------------------------------------------------------- #
+class PadToSquare:
+    """Ajoute des bandes noires pour obtenir un carré, sans déformer l'image
+    (les images Drishti-GS sont rectangulaires, ACRIMA quasi carrées)."""
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        w, h = img.size
+        s = max(w, h)
+        canvas = Image.new("RGB", (s, s), (0, 0, 0))
+        canvas.paste(img, ((s - w) // 2, (s - h) // 2))
+        return canvas
+
+
+def build_transforms(size: int):
+    train_tfm = T.Compose([
+        PadToSquare(),
+        T.Resize((size, size)),
+        T.RandomHorizontalFlip(),
+        T.RandomVerticalFlip(),
+        T.RandomRotation(15),
+        T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
+        T.ToTensor(),
+        T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+    ])
+    eval_tfm = T.Compose([
+        PadToSquare(),
+        T.Resize((size, size)),
+        T.ToTensor(),
+        T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+    ])
+    return train_tfm, eval_tfm
+
+
+class FundusDataset(Dataset):
+    def __init__(self, df: pd.DataFrame, tfm):
+        self.paths = df.path.tolist()
+        self.labels = df.label.astype(np.float32).tolist()
+        self.tfm = tfm
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, i):
+        img = Image.open(self.paths[i]).convert("RGB")
+        return self.tfm(img), torch.tensor(self.labels[i])
+
+
+# --------------------------------------------------------------------------- #
+# Entraînement / prédiction
+# --------------------------------------------------------------------------- #
+def train_one_epoch(model, loader, criterion, optimizer, scaler, device, use_amp):
+    model.train()
+    total = 0.0
+    for x, y in loader:
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(device_type=device.type, enabled=use_amp):
+            logits = model(x).squeeze(1)
+            loss = criterion(logits, y)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        total += loss.item() * x.size(0)
+    return total / len(loader.dataset)
+
+
+@torch.no_grad()
+def predict(model, loader, device, use_amp):
+    model.eval()
+    probs, labels = [], []
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        with torch.autocast(device_type=device.type, enabled=use_amp):
+            logits = model(x).squeeze(1)
+        probs.append(torch.sigmoid(logits.float()).cpu().numpy())
+        labels.append(y.numpy())
+    return np.concatenate(probs), np.concatenate(labels).astype(int)
+
+
+def safe_auc(y, p) -> float:
+    return float(roc_auc_score(y, p)) if len(np.unique(y)) > 1 else float("nan")
+
+
+def youden_threshold(y, p) -> float:
+    """Seuil maximisant sensibilité + spécificité - 1 (à choisir sur la validation)."""
+    fpr, tpr, thr = roc_curve(y, p)
+    return float(thr[np.argmax(tpr - fpr)])
+
+
+def compute_metrics(y, p, thr: float) -> dict:
+    pred = (p >= thr).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
+    return {
+        "n": int(len(y)),
+        "auc": safe_auc(y, p),
+        "accuracy": float(accuracy_score(y, pred)),
+        "sensitivity": float(tp / (tp + fn)) if (tp + fn) else float("nan"),
+        "specificity": float(tn / (tn + fp)) if (tn + fp) else float("nan"),
+        "f1": float(f1_score(y, pred, zero_division=0)),
+        "threshold": float(thr),
+        "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Explicabilité : Grad-CAM
+# --------------------------------------------------------------------------- #
+def gradcam(model, x: torch.Tensor):
+    """Grad-CAM sur la dernière carte de caractéristiques (API timm forward_features)."""
+    model.eval()
+    model.zero_grad()
+    feats = model.forward_features(x)
+    feats.retain_grad()
+    logit = model.forward_head(feats)
+    logit.sum().backward()
+    weights = feats.grad.mean(dim=(2, 3), keepdim=True)
+    cam = torch.relu((weights * feats).sum(dim=1, keepdim=True))
+    cam = F.interpolate(cam, size=x.shape[-2:], mode="bilinear", align_corners=False)[0, 0]
+    cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+    return cam.detach().cpu().numpy(), float(torch.sigmoid(logit).item())
+
+
+def save_gradcams(model, test_df, eval_tfm, device, out_dir: Path, n: int = 8):
+    out = out_dir / "gradcam"
+    out.mkdir(parents=True, exist_ok=True)
+    mean = torch.tensor(IMAGENET_MEAN).view(3, 1, 1)
+    std = torch.tensor(IMAGENET_STD).view(3, 1, 1)
+    sample = test_df.sample(min(n, len(test_df)), random_state=0)
+    for i, (_, r) in enumerate(sample.iterrows()):
+        x = eval_tfm(Image.open(r.path).convert("RGB")).unsqueeze(0).to(device)
+        cam, prob = gradcam(model, x)
+        base = (x[0].cpu() * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()
+        fig, ax = plt.subplots(1, 2, figsize=(8, 4))
+        ax[0].imshow(base)
+        ax[0].set_title(f"vrai: {'glaucome' if r.label else 'normal'}")
+        ax[1].imshow(base)
+        ax[1].imshow(cam, cmap="jet", alpha=0.45)
+        ax[1].set_title(f"P(glaucome)={prob:.2f}")
+        for a in ax:
+            a.axis("off")
+        fig.tight_layout()
+        fig.savefig(out / f"{i:02d}_{r.source}_{Path(r.path).stem}.png", dpi=120)
+        plt.close(fig)
+
+
+# --------------------------------------------------------------------------- #
+# Programme principal
+# --------------------------------------------------------------------------- #
+def parse_args():
+    ap = argparse.ArgumentParser(description="Détection du glaucome (ACRIMA / Drishti-GS)")
+    ap.add_argument("--mode", choices=["acrima", "cross"], default="acrima")
+    ap.add_argument("--acrima_dir", required=True)
+    ap.add_argument("--drishti_dir")
+    ap.add_argument("--drishti_labels", help="CSV (image,label) pour Drishti-GS")
+    ap.add_argument("--model", default="efficientnet_b0",
+                    help="n'importe quel modèle timm (resnet50, convnext_tiny, ...)")
+    ap.add_argument("--img_size", type=int, default=320)
+    ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--batch_size", type=int, default=16)
+    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--patience", type=int, default=7)
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--out_dir", default="runs/glaucoma")
+    args = ap.parse_args()
+    if args.mode == "cross" and not (args.drishti_dir and args.drishti_labels):
+        ap.error("--drishti_dir et --drishti_labels sont requis pour le mode cross.")
+    return args
+
+
+def main():
+    args = parse_args()
+    set_seed(args.seed)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = device.type == "cuda"
+    print(f"Device : {device} | modèle : {args.model} | mode : {args.mode}")
+
+    # Données
+    frames = [load_acrima(args.acrima_dir)]
+    if args.mode != "acrima":
+        frames.append(load_drishti(args.drishti_dir, args.drishti_labels))
+    df = pd.concat(frames, ignore_index=True)
+    print("Découpage :")
+    train_df, val_df, test_df = make_splits(df, args.mode, args.seed)
+
+    train_tfm, eval_tfm = build_transforms(args.img_size)
+    dl_kw = dict(batch_size=args.batch_size, num_workers=args.workers,
+                 pin_memory=device.type == "cuda")
+    train_loader = DataLoader(FundusDataset(train_df, train_tfm), shuffle=True,
+                              drop_last=len(train_df) > args.batch_size, **dl_kw)
+    val_loader = DataLoader(FundusDataset(val_df, eval_tfm), shuffle=False, **dl_kw)
+    test_loader = DataLoader(FundusDataset(test_df, eval_tfm), shuffle=False, **dl_kw)
+
+    # Modèle
+    model = timm.create_model(args.model, pretrained=True, num_classes=1).to(device)
+    pos_weight = torch.tensor((train_df.label == 0).sum() / max((train_df.label == 1).sum(), 1),
+                              dtype=torch.float32, device=device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
+
+    # Entraînement avec early stopping sur l'AUC de validation
+    best_auc, best_epoch, history = -1.0, 0, []
+    ckpt = out_dir / "best.pt"
+    for epoch in range(1, args.epochs + 1):
+        loss = train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, use_amp)
+        scheduler.step()
+        pv, yv = predict(model, val_loader, device, use_amp)
+        val_auc = safe_auc(yv, pv)
+        history.append({"epoch": epoch, "train_loss": loss, "val_auc": val_auc})
+        print(f"Epoch {epoch:02d}/{args.epochs} | loss={loss:.4f} | val AUC={val_auc:.4f}")
+        if val_auc > best_auc:
+            best_auc, best_epoch = val_auc, epoch
+            torch.save({"model": args.model, "img_size": args.img_size,
+                        "state_dict": model.state_dict()}, ckpt)
+        elif epoch - best_epoch >= args.patience:
+            print(f"Early stopping (meilleure epoch : {best_epoch}, AUC={best_auc:.4f})")
+            break
+
+    # Évaluation finale
+    model.load_state_dict(torch.load(ckpt, map_location=device)["state_dict"])
+    pv, yv = predict(model, val_loader, device, use_amp)
+    thr = youden_threshold(yv, pv)  # seuil choisi sur la validation, JAMAIS sur le test
+    pt, yt = predict(model, test_loader, device, use_amp)
+
+    results = {"overall": compute_metrics(yt, pt, thr)}
+    if test_df.source.nunique() > 1:
+        for src in test_df.source.unique():
+            m = (test_df.source == src).values
+            results[src] = compute_metrics(yt[m], pt[m], thr)
+    results["history"] = history
+
+    print("\n=== Résultats sur le jeu de test ===")
+    for k, v in results.items():
+        if k != "history":
+            print(f"[{k}] " + " | ".join(f"{a}={b:.3f}" if isinstance(b, float) else f"{a}={b}"
+                                        for a, b in v.items()))
+    (out_dir / "metrics.json").write_text(json.dumps(results, indent=2))
+
+    # Courbe ROC
+    plt.figure(figsize=(5, 5))
+    fpr, tpr, _ = roc_curve(yt, pt)
+    plt.plot(fpr, tpr, label=f"global (AUC={results['overall']['auc']:.3f})")
+    for src in test_df.source.unique():
+        if test_df.source.nunique() > 1:
+            m = (test_df.source == src).values
+            if len(np.unique(yt[m])) > 1:
+                f, t, _ = roc_curve(yt[m], pt[m])
+                plt.plot(f, t, "--", label=f"{src} (AUC={results[src]['auc']:.3f})")
+    plt.plot([0, 1], [0, 1], "k:", alpha=0.5)
+    plt.xlabel("1 - Spécificité")
+    plt.ylabel("Sensibilité")
+    plt.title(f"ROC – {args.model} ({args.mode})")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_dir / "roc.png", dpi=150)
+    plt.close()
+
+    # Grad-CAM
+    save_gradcams(model, test_df, eval_tfm, device, out_dir)
+    print(f"\nRésultats enregistrés dans : {out_dir.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
